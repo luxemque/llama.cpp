@@ -5,18 +5,24 @@
 #include "transport.h"
 
 #include <array>
+#include <atomic>
 #include <cinttypes>
+#include <condition_variable>
 #include <optional>
+#include <queue>
 #include <string>
+#include <thread>
 #include <vector>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
+
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
@@ -71,6 +77,8 @@ enum rpc_cmd {
     RPC_CMD_HELLO,
     RPC_CMD_DEVICE_COUNT,
     RPC_CMD_GRAPH_RECOMPUTE,
+    // parallel-rpc-loading branch: worker reads tensor bytes from a shared-fs path
+    RPC_CMD_SET_TENSOR_FROM_FILE,
     RPC_CMD_COUNT,
 };
 
@@ -190,6 +198,14 @@ struct rpc_msg_graph_recompute_req {
     uint32_t device;
 };
 
+// SET_TENSOR_FROM_FILE request body:
+//   | rpc_tensor | tensor_offset (8) | file_offset (8) | size (8) | path_len (4) | path[path_len] |
+// The variable-length tail makes this a vector<uint8_t> on the wire (like SET_TENSOR).
+struct rpc_msg_set_tensor_from_file_rsp {
+    uint8_t  result;       // 1 = success, 0 = failure (worker fell back; caller should push)
+    uint64_t bytes_read;   // bytes the worker actually read from the file (0 on failure)
+};
+
 #pragma pack(pop)
 
 // RPC data structures
@@ -242,7 +258,115 @@ struct ggml_backend_rpc_buffer_context {
     std::shared_ptr<socket_t> sock;
     void * base_ptr;
     uint64_t remote_ptr;
+    std::string endpoint;
 };
+
+// --- Load-time profiling (parallel-rpc-loading branch) -----------------------
+// Per-endpoint accumulator for what set_tensor / init_tensor cost during model
+// load. Always-on (counters are tiny); the dump is gated by the
+// LLAMA_RPC_LOAD_PROFILE env var inside the loader.
+
+struct rpc_load_stats {
+    uint64_t n_set_tensor       = 0;  // total set_tensor calls
+    uint64_t n_init_tensor      = 0;  // total init_tensor RPCs
+    uint64_t n_hash_check       = 0;  // SET_TENSOR_HASH attempts
+    uint64_t n_hash_hit         = 0;  // hash cache hits (no data sent)
+    uint64_t n_worker_read      = 0;  // SET_TENSOR_FROM_FILE successes (worker read from shared fs)
+    uint64_t n_worker_read_miss = 0;  // SET_TENSOR_FROM_FILE failures that fell back to push
+    uint64_t bytes_data         = 0;  // tensor bytes set (logical)
+    uint64_t bytes_sent         = 0;  // bytes actually sent over the wire (head→worker)
+    uint64_t bytes_skipped      = 0;  // bytes avoided via hash hit
+    uint64_t bytes_worker_read  = 0;  // bytes the worker pulled directly from shared fs
+    int64_t  t_set_us           = 0;  // wall time inside SET_TENSOR sends
+    int64_t  t_hash_us          = 0;  // wall time inside SET_TENSOR_HASH round-trips
+    int64_t  t_init_us          = 0;  // wall time inside INIT_TENSOR round-trips
+    int64_t  t_worker_read_us   = 0;  // wall time inside SET_TENSOR_FROM_FILE round-trips
+};
+
+static std::mutex                                 g_rpc_stats_mutex;
+static std::unordered_map<std::string, rpc_load_stats> g_rpc_stats;
+static int64_t                                    g_rpc_stats_t_start_us = 0;  // wall-clock start of current load
+
+static rpc_load_stats & rpc_stats_for(const std::string & endpoint) {
+    // caller holds g_rpc_stats_mutex
+    return g_rpc_stats[endpoint];
+}
+
+// --- Pipelined worker-read (B1: non-blocking SET_TENSOR_FROM_FILE) ----------
+// Per-endpoint background receiver thread drains command responses in FIFO
+// order while the head dispatches more. Each worker has its own socket, so
+// firing async dispatches at all three lets them read concurrently.
+// Auto-started on first _async dispatch for an endpoint; torn down by
+// ggml_backend_rpc_flush_pending_reads().
+// Assumes no concurrent sync RPC calls on the same endpoint while active.
+struct rpc_load_pipeline {
+    std::shared_ptr<socket_t> sock;
+    std::thread               recv_thread;
+    std::atomic<bool>         stop{false};
+    std::atomic<int64_t>      pending{0};
+    std::mutex                mu;
+    std::condition_variable   cv;
+    std::atomic<bool>         had_error{false};
+    uint64_t                  n_ok   = 0;
+    uint64_t                  n_fail = 0;
+};
+
+static std::mutex                                                           g_rpc_pipe_mu;
+static std::unordered_map<std::string, std::unique_ptr<rpc_load_pipeline>>  g_rpc_pipes;
+
+static void rpc_load_recv_loop(rpc_load_pipeline * p) {
+    while (true) {
+        {
+            std::unique_lock<std::mutex> lk(p->mu);
+            p->cv.wait(lk, [p]{ return p->pending.load() > 0 || p->stop.load(); });
+            if (p->stop.load() && p->pending.load() == 0) {
+                return;
+            }
+        }
+        uint64_t out_size = 0;
+        if (!p->sock->recv_data(&out_size, sizeof(out_size))) {
+            p->had_error.store(true);
+            std::lock_guard<std::mutex> lk(p->mu);
+            p->pending.store(0);
+            p->cv.notify_all();
+            return;
+        }
+        rpc_msg_set_tensor_from_file_rsp response = {};
+        if (out_size != sizeof(response) ||
+            !p->sock->recv_data(&response, sizeof(response))) {
+            p->had_error.store(true);
+            std::lock_guard<std::mutex> lk(p->mu);
+            p->pending.store(0);
+            p->cv.notify_all();
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(p->mu);
+            if (response.result) {
+                ++p->n_ok;
+            } else {
+                ++p->n_fail;
+                p->had_error.store(true);
+            }
+            --p->pending;
+            p->cv.notify_all();
+        }
+    }
+}
+
+static rpc_load_pipeline * get_or_start_pipeline(const std::string & endpoint, std::shared_ptr<socket_t> sock) {
+    std::lock_guard<std::mutex> lk(g_rpc_pipe_mu);
+    auto it = g_rpc_pipes.find(endpoint);
+    if (it != g_rpc_pipes.end()) {
+        return it->second.get();
+    }
+    auto p = std::make_unique<rpc_load_pipeline>();
+    p->sock = std::move(sock);
+    rpc_load_pipeline * ptr = p.get();
+    p->recv_thread = std::thread(rpc_load_recv_loop, ptr);
+    g_rpc_pipes.emplace(endpoint, std::move(p));
+    return ptr;
+}
 
 // RPC helper functions
 
@@ -473,27 +597,197 @@ static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_
 
         request.tensor = serialize_tensor(tensor);
 
+        const int64_t t0 = ggml_time_us();
         bool status = send_rpc_cmd(ctx->sock, RPC_CMD_INIT_TENSOR, &request, sizeof(request), nullptr, 0);
+        const int64_t dt = ggml_time_us() - t0;
+        {
+            std::lock_guard<std::mutex> lock(g_rpc_stats_mutex);
+            auto & s = rpc_stats_for(ctx->endpoint);
+            s.n_init_tensor++;
+            s.t_init_us += dt;
+        }
         RPC_STATUS_ASSERT(status);
     }
     return GGML_STATUS_SUCCESS;
 }
 
+// Worker-side file-read variant. Returns true on success (worker pulled the bytes
+// from the shared filesystem itself). Returns false on any failure, including:
+//   - buffer is not an RPC buffer
+//   - worker can't open the file or read fails
+//   - protocol mismatch with an older server
+// On false, the caller is expected to fall back to ggml_backend_rpc_buffer_set_tensor.
+extern "C" bool ggml_backend_rpc_buffer_set_tensor_from_file(
+        ggml_backend_buffer_t buffer,
+        ggml_tensor * tensor,
+        const char * file_path,
+        uint64_t file_offset,
+        uint64_t tensor_offset,
+        uint64_t size) {
+    if (buffer == nullptr || tensor == nullptr || file_path == nullptr) {
+        return false;
+    }
+    if (!ggml_backend_buffer_is_rpc(buffer)) {
+        return false;
+    }
+    ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    rpc_tensor rt = serialize_tensor(tensor);
+
+    // Build the variable-length request body.
+    const uint32_t path_len = (uint32_t) std::strlen(file_path);
+    const size_t input_size = sizeof(rpc_tensor) + 3 * sizeof(uint64_t) + sizeof(uint32_t) + path_len;
+    std::vector<uint8_t> input(input_size);
+    size_t off = 0;
+    std::memcpy(input.data() + off, &rt, sizeof(rt));            off += sizeof(rt);
+    std::memcpy(input.data() + off, &tensor_offset, sizeof(uint64_t)); off += sizeof(uint64_t);
+    std::memcpy(input.data() + off, &file_offset,   sizeof(uint64_t)); off += sizeof(uint64_t);
+    std::memcpy(input.data() + off, &size,          sizeof(uint64_t)); off += sizeof(uint64_t);
+    std::memcpy(input.data() + off, &path_len,      sizeof(uint32_t)); off += sizeof(uint32_t);
+    std::memcpy(input.data() + off, file_path, path_len);
+
+    rpc_msg_set_tensor_from_file_rsp response = {};
+    const int64_t t0 = ggml_time_us();
+    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_FROM_FILE,
+                               input.data(), input.size(),
+                               &response, sizeof(response));
+    const int64_t dt = ggml_time_us() - t0;
+    if (!status) {
+        // Old worker that doesn't know the command will close the socket on cmd>=COUNT.
+        // We can't recover gracefully from that here — abort so the user notices.
+        RPC_STATUS_ASSERT(status);
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_rpc_stats_mutex);
+        auto & s = rpc_stats_for(ctx->endpoint);
+        s.t_worker_read_us += dt;
+        if (response.result) {
+            s.n_set_tensor++;
+            s.n_worker_read++;
+            s.bytes_data        += size;
+            s.bytes_worker_read += response.bytes_read;
+        } else {
+            s.n_worker_read_miss++;
+        }
+    }
+    return response.result != 0;
+}
+
+// Fire-and-forget variant. Sends RPC_CMD_SET_TENSOR_FROM_FILE without blocking
+// for the response — a per-endpoint receiver thread drains responses in FIFO
+// order. Returns true if the send succeeded; actual read success is observed
+// later via ggml_backend_rpc_flush_pending_reads().
+extern "C" bool ggml_backend_rpc_buffer_set_tensor_from_file_async(
+        ggml_backend_buffer_t buffer,
+        ggml_tensor * tensor,
+        const char * file_path,
+        uint64_t file_offset,
+        uint64_t tensor_offset,
+        uint64_t size) {
+    if (buffer == nullptr || tensor == nullptr || file_path == nullptr) {
+        return false;
+    }
+    if (!ggml_backend_buffer_is_rpc(buffer)) {
+        return false;
+    }
+    ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    rpc_tensor rt = serialize_tensor(tensor);
+
+    const uint32_t path_len = (uint32_t) std::strlen(file_path);
+    const size_t input_size = sizeof(rpc_tensor) + 3 * sizeof(uint64_t) + sizeof(uint32_t) + path_len;
+    std::vector<uint8_t> input(input_size);
+    size_t off = 0;
+    std::memcpy(input.data() + off, &rt, sizeof(rt));                  off += sizeof(rt);
+    std::memcpy(input.data() + off, &tensor_offset, sizeof(uint64_t)); off += sizeof(uint64_t);
+    std::memcpy(input.data() + off, &file_offset,   sizeof(uint64_t)); off += sizeof(uint64_t);
+    std::memcpy(input.data() + off, &size,          sizeof(uint64_t)); off += sizeof(uint64_t);
+    std::memcpy(input.data() + off, &path_len,      sizeof(uint32_t)); off += sizeof(uint32_t);
+    std::memcpy(input.data() + off, file_path, path_len);
+
+    rpc_load_pipeline * pipe = get_or_start_pipeline(ctx->endpoint, ctx->sock);
+    {
+        std::lock_guard<std::mutex> lk(pipe->mu);
+        ++pipe->pending;
+        pipe->cv.notify_all();
+    }
+    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_FROM_FILE,
+                               input.data(), input.size());
+    if (!status) {
+        std::lock_guard<std::mutex> lk(pipe->mu);
+        --pipe->pending;
+        pipe->had_error.store(true);
+        pipe->cv.notify_all();
+        RPC_STATUS_ASSERT(status);
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_rpc_stats_mutex);
+        auto & s = rpc_stats_for(ctx->endpoint);
+        s.n_set_tensor++;
+        s.n_worker_read++;
+        s.bytes_data        += size;
+        s.bytes_worker_read += size;
+    }
+    return true;
+}
+
+// Waits for all in-flight async set_tensor_from_file reads across all
+// endpoints, then tears down per-endpoint receiver threads. Returns false if
+// any pipeline observed an error (failed read, socket error, or non-success
+// response).
+extern "C" bool ggml_backend_rpc_flush_pending_reads(void) {
+    std::unordered_map<std::string, std::unique_ptr<rpc_load_pipeline>> pipes;
+    {
+        std::lock_guard<std::mutex> lk(g_rpc_pipe_mu);
+        pipes.swap(g_rpc_pipes);
+    }
+    bool ok = true;
+    for (auto & kv : pipes) {
+        auto & p = kv.second;
+        {
+            std::unique_lock<std::mutex> lk(p->mu);
+            p->cv.wait(lk, [&]{ return p->pending.load() == 0 || p->had_error.load(); });
+            p->stop.store(true);
+            p->cv.notify_all();
+        }
+        if (p->recv_thread.joinable()) {
+            p->recv_thread.join();
+        }
+        if (p->had_error.load()) {
+            ok = false;
+        }
+    }
+    return ok;
+}
+
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
+    bool hash_hit = false;
+    int64_t t_hash_us = 0;
     if (size > HASH_THRESHOLD) {
         rpc_msg_set_tensor_hash_req request;
         request.tensor = rpc_tensor;
         request.offset = offset;
         request.hash = fnv_hash((const uint8_t*)data, size);
         rpc_msg_set_tensor_hash_rsp response;
+        const int64_t t0 = ggml_time_us();
         bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_HASH, &request, sizeof(request), &response, sizeof(response));
+        t_hash_us = ggml_time_us() - t0;
         RPC_STATUS_ASSERT(status);
         if (response.result) {
             // the server has the same data, no need to send it
-            return;
+            hash_hit = true;
         }
+    }
+    if (hash_hit) {
+        std::lock_guard<std::mutex> lock(g_rpc_stats_mutex);
+        auto & s = rpc_stats_for(ctx->endpoint);
+        s.n_set_tensor++;
+        s.n_hash_check++;
+        s.n_hash_hit++;
+        s.bytes_data    += size;
+        s.bytes_skipped += size;
+        s.t_hash_us     += t_hash_us;
+        return;
     }
     // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes)
     size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
@@ -501,7 +795,21 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
     memcpy(input.data(), &rpc_tensor, sizeof(rpc_tensor));
     memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
     memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
+    const int64_t t0 = ggml_time_us();
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
+    const int64_t dt = ggml_time_us() - t0;
+    {
+        std::lock_guard<std::mutex> lock(g_rpc_stats_mutex);
+        auto & s = rpc_stats_for(ctx->endpoint);
+        s.n_set_tensor++;
+        if (size > HASH_THRESHOLD) {
+            s.n_hash_check++;       // attempted but missed
+            s.t_hash_us += t_hash_us;
+        }
+        s.bytes_data += size;
+        s.bytes_sent += input_size;
+        s.t_set_us   += dt;
+    }
     RPC_STATUS_ASSERT(status);
 }
 
@@ -573,7 +881,7 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
     if (response.remote_ptr != 0) {
         ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft,
             ggml_backend_rpc_buffer_interface,
-            new ggml_backend_rpc_buffer_context{sock, nullptr, response.remote_ptr},
+            new ggml_backend_rpc_buffer_context{sock, nullptr, response.remote_ptr, buft_ctx->endpoint},
             response.remote_size);
         return buffer;
     } else {
@@ -837,6 +1145,12 @@ public:
     rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir)
         : backends(std::move(all_backends)), cache_dir(cache_dir) {
         stored_graphs.resize(backends.size());
+        // staging_buffers[backend_idx][0] — single slot used by the
+        // main-thread SET_TENSOR_FROM_FILE handler.
+        staging_buffers.resize(backends.size());
+        for (auto & row : staging_buffers) {
+            row.resize(1);
+        }
     }
     ~rpc_server();
 
@@ -849,6 +1163,7 @@ public:
     bool buffer_clear(const rpc_msg_buffer_clear_req & request);
     bool set_tensor(const std::vector<uint8_t> & input);
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
+    bool set_tensor_from_file(const std::vector<uint8_t> & input, rpc_msg_set_tensor_from_file_rsp & response, size_t thread_idx = 0);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
     bool graph_compute(const std::vector<uint8_t> & input);
@@ -862,6 +1177,18 @@ public:
         ggml_cgraph          * graph;
     };
 
+    // Per-backend pinned staging region for set_tensor_from_file. Allocated
+    // lazily on first use via the backend's host buffer type (pinned memory
+    // on CUDA/HIP; plain malloc on CPU). Grows as needed to fit the largest
+    // tensor seen. See _enhancements/findings.md "Warm-cache rerun" section —
+    // HtoD from pageable std::vector was ~340 ms per 294 MiB tensor; from
+    // pinned it should be ~15 ms.
+    struct staging_buffer {
+        ggml_backend_buffer_t buf      = nullptr;
+        uint8_t *             ptr      = nullptr;
+        size_t                capacity = 0;
+    };
+
 private:
     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
     ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor);
@@ -870,12 +1197,24 @@ private:
                               const std::unordered_map<uint64_t, const rpc_tensor*> & tensor_ptrs,
                               std::unordered_map<uint64_t, struct ggml_tensor*> & tensor_map);
 
+    // Returns a host pointer to a staging region of at least `needed` bytes
+    // for `(backend_idx, thread_idx)`. Grows the region on demand. Returns
+    // nullptr if the backend has no host buffer type or allocation fails —
+    // caller falls back to a pageable std::vector.
+    uint8_t * get_staging(size_t backend_idx, size_t thread_idx, size_t needed);
+
+    // Returns the index into `backends` that owns `tensor->buffer`, or -1.
+    int find_backend_for_tensor(const ggml_tensor * tensor) const;
+
 
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
     std::unordered_set<ggml_backend_buffer_t> buffers;
     // store the last computed graph for each backend
     std::vector<stored_graph> stored_graphs;
+    // staging_buffers[backend_idx][0] — reused pinned host staging region
+    // for the main-thread SET_TENSOR_FROM_FILE handler.
+    std::vector<std::vector<staging_buffer>> staging_buffers;
 };
 
 void rpc_server::hello(rpc_msg_hello_rsp & response) {
@@ -1104,6 +1443,178 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
         GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.c_str());
     }
     ggml_backend_tensor_set(tensor, data, offset, size);
+    return true;
+}
+
+// Worker-side handler for SET_TENSOR_FROM_FILE.
+// Parses request, opens the file, reads bytes, writes them into the tensor's
+// destination buffer. Returns true on success and sets response.result accordingly.
+// On any failure (path validation, open, read, bounds), response.result=0 — the
+// client will fall back to RPC_CMD_SET_TENSOR for that tensor.
+int rpc_server::find_backend_for_tensor(const ggml_tensor * tensor) const {
+    if (tensor == nullptr || tensor->buffer == nullptr) {
+        return -1;
+    }
+    ggml_backend_dev_t want = tensor->buffer->buft->device;
+    for (size_t i = 0; i < backends.size(); ++i) {
+        if (ggml_backend_get_device(backends[i]) == want) {
+            return (int) i;
+        }
+    }
+    return -1;
+}
+
+uint8_t * rpc_server::get_staging(size_t backend_idx, size_t thread_idx, size_t needed) {
+    if (backend_idx >= staging_buffers.size()) {
+        return nullptr;
+    }
+    auto & row = staging_buffers[backend_idx];
+    if (thread_idx >= row.size()) {
+        return nullptr;
+    }
+    staging_buffer & sb = row[thread_idx];
+    if (sb.capacity >= needed && sb.ptr != nullptr) {
+        return sb.ptr;
+    }
+    // Need to (re)allocate. Free any existing region first.
+    if (sb.buf != nullptr) {
+        ggml_backend_buffer_free(sb.buf);
+        sb.buf = nullptr;
+        sb.ptr = nullptr;
+        sb.capacity = 0;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backends[backend_idx]);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
+    if (host_buft == nullptr) {
+        // Backend doesn't expose a host buffer type (e.g. pure-CPU build) —
+        // caller will fall back to std::vector, which is fine there.
+        return nullptr;
+    }
+    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(host_buft, needed);
+    if (buf == nullptr) {
+        GGML_LOG_DEBUG("[%s] failed to allocate %zu byte pinned staging buffer for backend %zu thread %zu\n",
+                       __func__, needed, backend_idx, thread_idx);
+        return nullptr;
+    }
+    sb.buf      = buf;
+    sb.ptr      = (uint8_t *) ggml_backend_buffer_get_base(buf);
+    sb.capacity = needed;
+    return sb.ptr;
+}
+
+bool rpc_server::set_tensor_from_file(const std::vector<uint8_t> & input,
+                                      rpc_msg_set_tensor_from_file_rsp & response,
+                                      size_t thread_idx) {
+    response.result     = 0;
+    response.bytes_read = 0;
+
+    // Layout: | rpc_tensor | tensor_offset (8) | file_offset (8) | size (8) | path_len (4) | path[path_len] |
+    constexpr size_t fixed_size = sizeof(rpc_tensor) + 3 * sizeof(uint64_t) + sizeof(uint32_t);
+    if (input.size() < fixed_size) {
+        GGML_LOG_ERROR("[%s] request too short (%zu)\n", __func__, input.size());
+        return true; // ok=true means we sent a response; result=0 signals failure
+    }
+    const rpc_tensor * in_tensor = (const rpc_tensor *) input.data();
+    size_t off = sizeof(rpc_tensor);
+    uint64_t tensor_offset = 0, file_offset = 0, size = 0;
+    uint32_t path_len = 0;
+    std::memcpy(&tensor_offset, input.data() + off, sizeof(uint64_t)); off += sizeof(uint64_t);
+    std::memcpy(&file_offset,   input.data() + off, sizeof(uint64_t)); off += sizeof(uint64_t);
+    std::memcpy(&size,          input.data() + off, sizeof(uint64_t)); off += sizeof(uint64_t);
+    std::memcpy(&path_len,      input.data() + off, sizeof(uint32_t)); off += sizeof(uint32_t);
+    if (input.size() < fixed_size + path_len) {
+        GGML_LOG_ERROR("[%s] truncated path (have %zu, need %zu)\n",
+                       __func__, input.size(), fixed_size + path_len);
+        return true;
+    }
+    std::string path((const char *) input.data() + off, path_len);
+
+    // Path safety: must be absolute, no embedded NUL, no parent traversal.
+    if (path.empty() || path[0] != '/' || path.find('\0') != std::string::npos
+        || path.find("/../") != std::string::npos
+        || path.size() > 4096) {
+        GGML_LOG_ERROR("[%s] rejected path '%s'\n", __func__, path.c_str());
+        return true;
+    }
+
+    // Deserialize the destination tensor (mirrors set_tensor).
+    struct ggml_init_params params {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+    ggml_context * ctx = ctx_ptr.get();
+    ggml_tensor * tensor = deserialize_tensor(ctx, in_tensor);
+    if (tensor == nullptr || tensor->buffer == nullptr) {
+        GGML_LOG_ERROR("[%s] error deserializing tensor\n", __func__);
+        return true;
+    }
+
+    // Bounds check — same form as set_tensor at line ~1153.
+    {
+        const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
+        const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
+        if (in_tensor->data + tensor_offset < p0
+         || in_tensor->data + tensor_offset >= p1
+         || size > (p1 - in_tensor->data - tensor_offset)) {
+            GGML_LOG_ERROR("[%s] tensor data region out of buffer bounds\n", __func__);
+            return true;
+        }
+    }
+
+    // Read into a pinned staging buffer (via the backend's host buffer type)
+    // so the subsequent HtoD inside ggml_backend_tensor_set runs as a genuine
+    // pinned DMA (~10–25 GiB/s) rather than a pageable staging copy (~0.8
+    // GiB/s). The pageable std::vector path remains the fallback for any
+    // backend that doesn't expose a host buffer type, or if pinned alloc
+    // fails (e.g. out of wired memory). See _enhancements/findings.md.
+    //
+    // N.B. mmap fast-path was tried here — it caused a 3× regression because
+    // cudaMemcpyAsync on unpinned mmap'd memory demand-faults pages one-at-a-
+    // time. Pinning from a pread'd buffer is the right shape.
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs.is_open()) {
+        GGML_LOG_ERROR("[%s] cannot open '%s'\n", __func__, path.c_str());
+        return true; // signal fallback
+    }
+    ifs.seekg((std::streamoff) file_offset, std::ios::beg);
+    if (!ifs.good()) {
+        GGML_LOG_ERROR("[%s] seek to %" PRIu64 " in '%s' failed\n",
+                       __func__, file_offset, path.c_str());
+        return true;
+    }
+
+    uint8_t * dst = nullptr;
+    std::vector<uint8_t> fallback_buf;
+    const int backend_idx = find_backend_for_tensor(tensor);
+    if (backend_idx >= 0) {
+        dst = get_staging((size_t) backend_idx, thread_idx, size);
+    }
+    if (dst == nullptr) {
+        // Fall back to pageable host memory. Correct but slower; path runs
+        // for CPU-only builds or if pinned alloc failed.
+        fallback_buf.resize(size);
+        dst = fallback_buf.data();
+    }
+
+    ifs.read((char *) dst, (std::streamsize) size);
+    const std::streamsize got = ifs.gcount();
+    if ((uint64_t) got != size) {
+        GGML_LOG_ERROR("[%s] short read at %" PRIu64 " in '%s': got %lld of %" PRIu64 "\n",
+                       __func__, file_offset, path.c_str(),
+                       (long long) got, size);
+        return true;
+    }
+
+    ggml_backend_tensor_set(tensor, dst, tensor_offset, size);
+
+    response.result     = 1;
+    response.bytes_read = size;
     return true;
 }
 
@@ -1439,6 +1950,13 @@ rpc_server::~rpc_server() {
     for (auto buffer : buffers) {
         ggml_backend_buffer_free(buffer);
     }
+    for (auto & row : staging_buffers) {
+        for (auto & sb : row) {
+            if (sb.buf != nullptr) {
+                ggml_backend_buffer_free(sb.buf);
+            }
+        }
+    }
 }
 
 static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
@@ -1480,6 +1998,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
 
     // Activate transport upgrade using client's caps
     sock->update_caps(req.conn_caps);
+
     while (true) {
         if (!sock->recv_data(&cmd, 1)) {
             break;
@@ -1618,6 +2137,20 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 rpc_msg_set_tensor_hash_rsp response;
                 if (!server.set_tensor_hash(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_SET_TENSOR_FROM_FILE: {
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    return;
+                }
+                rpc_msg_set_tensor_from_file_rsp response = {};
+                if (!server.set_tensor_from_file(input, response)) {
                     return;
                 }
                 if (!send_msg(sock, &response, sizeof(response))) {
@@ -1905,12 +2438,111 @@ static ggml_backend_dev_t ggml_backend_rpc_reg_get_device(ggml_backend_reg_t reg
     }
 }
 
+// Reset all per-endpoint load stats and start the wall-clock timer.
+// Called by the loader before load_all_data.
+extern "C" void ggml_backend_rpc_load_stats_reset(void) {
+    std::lock_guard<std::mutex> lock(g_rpc_stats_mutex);
+    g_rpc_stats.clear();
+    g_rpc_stats_t_start_us = ggml_time_us();
+}
+
+// Log a per-endpoint summary of what set_tensor / init_tensor cost during load,
+// plus the loader's overall wall time. Called by the loader after load_all_data
+// when LLAMA_RPC_LOAD_PROFILE is set.
+extern "C" void ggml_backend_rpc_log_load_stats(void) {
+    std::lock_guard<std::mutex> lock(g_rpc_stats_mutex);
+    const int64_t t_wall_us = g_rpc_stats_t_start_us > 0
+        ? ggml_time_us() - g_rpc_stats_t_start_us
+        : 0;
+    if (g_rpc_stats.empty()) {
+        if (t_wall_us > 0) {
+            GGML_LOG_INFO("RPC load profile: no RPC tensor activity (wall %.3f s)\n",
+                          (double) t_wall_us / 1.0e6);
+        }
+        return;
+    }
+    GGML_LOG_INFO("RPC load profile (per-worker):\n");
+    GGML_LOG_INFO("  %-24s %8s %8s %8s %8s %10s %10s %10s %10s %9s %9s %9s\n",
+                  "endpoint", "n_set", "n_hash", "n_hit", "n_wread",
+                  "data_GB", "sent_GB", "skip_GB", "wread_GB",
+                  "t_set_s", "t_hash_s", "t_wread_s");
+    rpc_load_stats totals;
+    for (const auto & kv : g_rpc_stats) {
+        const auto & ep = kv.first;
+        const auto & s  = kv.second;
+        GGML_LOG_INFO("  %-24s %8" PRIu64 " %8" PRIu64 " %8" PRIu64 " %8" PRIu64
+                      " %10.3f %10.3f %10.3f %10.3f %9.3f %9.3f %9.3f\n",
+                      ep.c_str(),
+                      s.n_set_tensor, s.n_hash_check, s.n_hash_hit, s.n_worker_read,
+                      (double) s.bytes_data        / (1024.0 * 1024.0 * 1024.0),
+                      (double) s.bytes_sent        / (1024.0 * 1024.0 * 1024.0),
+                      (double) s.bytes_skipped     / (1024.0 * 1024.0 * 1024.0),
+                      (double) s.bytes_worker_read / (1024.0 * 1024.0 * 1024.0),
+                      (double) s.t_set_us         / 1.0e6,
+                      (double) s.t_hash_us        / 1.0e6,
+                      (double) s.t_worker_read_us / 1.0e6);
+        totals.n_set_tensor       += s.n_set_tensor;
+        totals.n_hash_check       += s.n_hash_check;
+        totals.n_hash_hit         += s.n_hash_hit;
+        totals.n_worker_read      += s.n_worker_read;
+        totals.n_worker_read_miss += s.n_worker_read_miss;
+        totals.bytes_data         += s.bytes_data;
+        totals.bytes_sent         += s.bytes_sent;
+        totals.bytes_skipped      += s.bytes_skipped;
+        totals.bytes_worker_read  += s.bytes_worker_read;
+        totals.t_set_us           += s.t_set_us;
+        totals.t_hash_us          += s.t_hash_us;
+        totals.t_worker_read_us   += s.t_worker_read_us;
+    }
+    GGML_LOG_INFO("  %-24s %8" PRIu64 " %8" PRIu64 " %8" PRIu64 " %8" PRIu64
+                  " %10.3f %10.3f %10.3f %10.3f %9.3f %9.3f %9.3f\n",
+                  "TOTAL",
+                  totals.n_set_tensor, totals.n_hash_check, totals.n_hash_hit, totals.n_worker_read,
+                  (double) totals.bytes_data        / (1024.0 * 1024.0 * 1024.0),
+                  (double) totals.bytes_sent        / (1024.0 * 1024.0 * 1024.0),
+                  (double) totals.bytes_skipped     / (1024.0 * 1024.0 * 1024.0),
+                  (double) totals.bytes_worker_read / (1024.0 * 1024.0 * 1024.0),
+                  (double) totals.t_set_us         / 1.0e6,
+                  (double) totals.t_hash_us        / 1.0e6,
+                  (double) totals.t_worker_read_us / 1.0e6);
+    if (totals.n_worker_read_miss > 0) {
+        GGML_LOG_INFO("  worker-read fallbacks: %" PRIu64 " (worker couldn't open/read)\n",
+                      totals.n_worker_read_miss);
+    }
+    if (totals.t_set_us > 0) {
+        const double mb_per_s = ((double) totals.bytes_sent / (1024.0 * 1024.0)) /
+                                ((double) totals.t_set_us  / 1.0e6);
+        GGML_LOG_INFO("  aggregate set_tensor throughput: %.1f MB/s (sum-of-sends, not wall)\n", mb_per_s);
+    }
+    if (t_wall_us > 0) {
+        GGML_LOG_INFO("  loader wall time: %.3f s; effective wall throughput: %.1f MB/s\n",
+                      (double) t_wall_us / 1.0e6,
+                      ((double) totals.bytes_sent / (1024.0 * 1024.0)) /
+                       ((double) t_wall_us / 1.0e6));
+    }
+}
+
 static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (std::strcmp(name, "ggml_backend_rpc_add_server") == 0) {
         return (void *)ggml_backend_rpc_add_server;
     }
     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
         return (void *)ggml_backend_rpc_start_server;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_load_stats_reset") == 0) {
+        return (void *)ggml_backend_rpc_load_stats_reset;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_log_load_stats") == 0) {
+        return (void *)ggml_backend_rpc_log_load_stats;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_buffer_set_tensor_from_file") == 0) {
+        return (void *)ggml_backend_rpc_buffer_set_tensor_from_file;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_buffer_set_tensor_from_file_async") == 0) {
+        return (void *)ggml_backend_rpc_buffer_set_tensor_from_file_async;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_flush_pending_reads") == 0) {
+        return (void *)ggml_backend_rpc_flush_pending_reads;
     }
     return NULL;
 
