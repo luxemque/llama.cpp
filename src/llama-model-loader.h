@@ -9,10 +9,12 @@
 
 #include "ggml-cpp.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstring>
 #include <map>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 
 using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
@@ -81,6 +83,10 @@ struct llama_model_loader {
     bool no_alloc;
 
     llama_files files;
+    // Filesystem paths for each entry in `files` (parallel array).
+    // Empty string when the file was opened from a FILE* (no path available),
+    // in which case the parallel-rpc-loading worker-read path can't be used.
+    std::vector<std::string> files_paths;
     llama_ftype ftype;
     llama_fver  fver;
 
@@ -102,6 +108,12 @@ struct llama_model_loader {
     size_t size_done = 0;
     size_t size_data = 0;
     std::vector<std::pair<size_t, size_t>> mmaps_used;
+
+    // B1-v2: dispatcher threads for parallel RPC worker loads. Populated by
+    // load_all_data when LLAMA_RPC_PARALLEL_LOAD_ASYNC is active and the
+    // buffer is RPC-backed. Joined by flush_pending_rpc_reads().
+    std::vector<std::thread> rpc_dispatch_threads;
+    std::atomic<bool>        rpc_dispatch_error{false};
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
@@ -200,6 +212,23 @@ struct llama_model_loader {
             llama_mlocks * lmlocks,
             llama_progress_callback progress_callback,
             void * progress_callback_user_data);
+
+    // B1-v3: wrapper around load_all_data that, when LLAMA_RPC_PARALLEL_LOAD_ASYNC
+    // is active and the buffer is parallelizable (GPU ring path or RPC-backed),
+    // spawns a dispatcher thread and returns true immediately. CPU/host buffers
+    // run synchronously. Threads are joined by flush_pending_rpc_reads().
+    bool launch_load_all_data(
+            struct ggml_context * ctx,
+            llama_buf_map & bufs,
+            llama_mlocks * lmlocks,
+            llama_progress_callback progress_callback,
+            void * progress_callback_user_data);
+
+    // Waits for any in-flight async RPC worker reads + dispatcher threads to
+    // complete, surfacing errors. Safe to call even when the parallel-async
+    // path was not used. Must be called after the launch_load_all_data() loop
+    // before tensors are read.
+    bool flush_pending_rpc_reads();
 
     std::string ftype_name() const;
 

@@ -1,17 +1,62 @@
 #include "llama-model-loader.h"
 
 #include "ggml-alloc.h"
+#include "ggml-backend.h"
 #include "ggml.h"
 #include "gguf.h"
 #include "llama-hparams.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cinttypes>
+#include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <future>
+#include <mutex>
+#include <queue>
 #include <regex>
+#include <thread>
+#include <vector>
+
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
+// Look up an RPC-backend proc by name. Returns nullptr if RPC is not built in
+// or the symbol is not registered. Used for opt-in load profiling and the
+// worker-side file-read path (parallel-rpc-loading).
+static void * rpc_proc_address(const char * name) {
+    ggml_backend_reg_t rpc_reg = ggml_backend_reg_by_name("RPC");
+    if (rpc_reg == nullptr) {
+        return nullptr;
+    }
+    return ggml_backend_reg_get_proc_address(rpc_reg, name);
+}
+
+// Signature must match ggml_backend_rpc_buffer_set_tensor_from_file in ggml-rpc.h.
+typedef bool (*rpc_set_tensor_from_file_fn_t)(
+        ggml_backend_buffer_t buffer,
+        struct ggml_tensor * tensor,
+        const char * file_path,
+        uint64_t file_offset,
+        uint64_t tensor_offset,
+        uint64_t size);
+
+// Same signature as the sync variant. Dispatch is fire-and-forget; success
+// reported later via ggml_backend_rpc_flush_pending_reads.
+typedef bool (*rpc_set_tensor_from_file_async_fn_t)(
+        ggml_backend_buffer_t buffer,
+        struct ggml_tensor * tensor,
+        const char * file_path,
+        uint64_t file_offset,
+        uint64_t tensor_offset,
+        uint64_t size);
+
+typedef bool (*rpc_flush_pending_reads_fn_t)(void);
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -552,6 +597,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
+        files_paths.emplace_back(fname);
         contexts.emplace_back(ctx);
 
         if (use_mmap && use_direct_io) {
@@ -565,6 +611,7 @@ llama_model_loader::llama_model_loader(
                 // reopen file using std::fopen for mmap
                 files.pop_back();
                 files.emplace_back(new llama_file(fname.c_str(), "rb", false));
+                // files_paths entry is unchanged — same fname.
             }
         }
 
@@ -634,6 +681,7 @@ llama_model_loader::llama_model_loader(
                 }
 
                 files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
+                files_paths.emplace_back(fname_split);
                 contexts.emplace_back(ctx);
 
                 // Save tensors data offset info of the shard.
@@ -678,6 +726,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(file));
+        files_paths.emplace_back();   // FILE* path: parallel-load not available
         contexts.emplace_back(ctx);
 
         // Save tensors data offset info of the main file.
@@ -1396,6 +1445,134 @@ void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
     }
 }
 
+#ifndef _WIN32
+// Refactor E — QD>1 pread pool for the head-local GPU ring path. The ring
+// buffer already pipelines HtoD uploads across n_buffers pinned slots, but
+// the disk read feeding it was a single blocking `file->read_raw_unsafe()`
+// per chunk (QD=1). On GB10 with a single NVMe this caps the head at ~1.1
+// GiB/s, leaving the head-local layers as the critical path after the
+// worker-side QD=8 pool landed in Refactor D (see _enhancements/findings.md).
+// Each pool worker issues a blocking pread against the shared fd (pread is
+// atomic and independent of the fd's seek offset, so concurrent reads from
+// different offsets are safe and don't collide with the main thread's own
+// seek+read for CPU-bound tensors).
+struct head_read_task {
+    int       fd      = -1;
+    void *    dst     = nullptr;
+    size_t    len     = 0;
+    off_t     offset  = 0;
+    bool      ok      = false;
+    std::atomic<bool>        done{false};
+    std::mutex               mu;
+    std::condition_variable  cv;
+
+    void mark_done(bool success) {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            ok = success;
+            done.store(true, std::memory_order_release);
+        }
+        cv.notify_all();
+    }
+    bool wait_done() {
+        std::unique_lock<std::mutex> lk(mu);
+        cv.wait(lk, [&]{ return done.load(std::memory_order_acquire); });
+        return ok;
+    }
+};
+
+class head_read_pool {
+public:
+    explicit head_read_pool(size_t n_threads) : n_(n_threads) {
+        workers_.reserve(n_threads);
+        for (size_t i = 0; i < n_threads; ++i) {
+            workers_.emplace_back([this]() { worker_loop(); });
+        }
+    }
+    ~head_read_pool() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        for (auto & t : workers_) {
+            if (t.joinable()) t.join();
+        }
+    }
+
+    void submit(head_read_task * t) {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            q_.push(t);
+        }
+        cv_.notify_one();
+    }
+
+    size_t size() const { return n_; }
+
+private:
+    void worker_loop() {
+        while (true) {
+            head_read_task * t = nullptr;
+            {
+                std::unique_lock<std::mutex> lk(mu_);
+                cv_.wait(lk, [&]{ return stop_ || !q_.empty(); });
+                if (stop_ && q_.empty()) {
+                    return;
+                }
+                t = q_.front();
+                q_.pop();
+            }
+            bool ok   = true;
+            size_t d  = 0;
+            while (d < t->len) {
+                ssize_t r = ::pread(t->fd,
+                                    reinterpret_cast<char *>(t->dst) + d,
+                                    t->len - d,
+                                    t->offset + (off_t) d);
+                if (r < 0) {
+                    if (errno == EINTR) continue;
+                    ok = false;
+                    break;
+                }
+                if (r == 0) {
+                    // Unexpected EOF mid-read. The ring path never reads
+                    // past the aligned tensor boundary, so treat this as a
+                    // short read and let the caller discover the failure.
+                    ok = false;
+                    break;
+                }
+                d += (size_t) r;
+            }
+            t->mark_done(ok);
+        }
+    }
+
+    size_t                          n_;
+    std::vector<std::thread>        workers_;
+    std::queue<head_read_task *>    q_;
+    std::mutex                      mu_;
+    std::condition_variable         cv_;
+    bool                            stop_ = false;
+};
+
+// Default pool size: 8 (same as the worker side). Set LLAMA_HEAD_READ_POOL=0
+// to disable the pool and fall back to the serial read_raw_unsafe path.
+static size_t head_read_pool_size() {
+    static size_t cached = [](){
+        const char * s = std::getenv("LLAMA_HEAD_READ_POOL");
+        if (s != nullptr) {
+            long v = std::atol(s);
+            if (v >= 0 && v <= 64) {
+                return (size_t) v;
+            }
+        }
+        return (size_t) 8;
+    }();
+    return cached;
+}
+#endif // _WIN32
+
 bool llama_model_loader::load_all_data(
         struct ggml_context * ctx,
         llama_buf_map & bufs,
@@ -1410,12 +1587,65 @@ bool llama_model_loader::load_all_data(
     }
     GGML_ASSERT(size_data != 0 && "call init_mappings() first");
 
+    // On first entry, reset RPC load-profile counters so the dump at end of
+    // the *last* call covers the full load. No-op when RPC is not built.
+    if (size_done == 0) {
+        if (auto * fn = (void (*)(void)) rpc_proc_address("ggml_backend_rpc_load_stats_reset")) {
+            fn();
+        }
+    }
+
+    // Opt-in worker-side reads from shared filesystem (parallel-rpc-loading).
+    // When LLAMA_RPC_PARALLEL_LOAD is set, for tensors destined for an RPC
+    // backend we send {file_path, offset, size} and the worker reads bytes
+    // itself rather than receiving them pushed from the head. The capability
+    // is detected once (proc-address lookup) and cached for the whole load.
+    // When LLAMA_RPC_PARALLEL_LOAD_ASYNC is also set (B1), dispatch is
+    // fire-and-forget per tensor — a per-endpoint receiver thread in the RPC
+    // backend drains responses, and ml.flush_pending_rpc_reads() gathers them
+    // after all load_all_data() calls return. This lets the 3 workers load
+    // concurrently instead of serializing one buffer-set at a time.
+    static const bool parallel_load_enabled = std::getenv("LLAMA_RPC_PARALLEL_LOAD") != nullptr;
+    static const bool parallel_load_async   = parallel_load_enabled &&
+                                              std::getenv("LLAMA_RPC_PARALLEL_LOAD_ASYNC") != nullptr;
+    rpc_set_tensor_from_file_fn_t        rpc_set_from_file       = nullptr;
+    rpc_set_tensor_from_file_async_fn_t  rpc_set_from_file_async = nullptr;
+    if (parallel_load_enabled) {
+        rpc_set_from_file = (rpc_set_tensor_from_file_fn_t)
+            rpc_proc_address("ggml_backend_rpc_buffer_set_tensor_from_file");
+        if (rpc_set_from_file == nullptr && size_done == 0) {
+            LLAMA_LOG_WARN("%s: LLAMA_RPC_PARALLEL_LOAD requested but RPC backend "
+                           "does not expose worker-read capability — falling back\n", __func__);
+        }
+    }
+    if (parallel_load_async) {
+        rpc_set_from_file_async = (rpc_set_tensor_from_file_async_fn_t)
+            rpc_proc_address("ggml_backend_rpc_buffer_set_tensor_from_file_async");
+        if (rpc_set_from_file_async == nullptr && size_done == 0) {
+            LLAMA_LOG_WARN("%s: LLAMA_RPC_PARALLEL_LOAD_ASYNC requested but RPC backend "
+                           "does not expose async dispatch — falling back to blocking path\n", __func__);
+        } else if (size_done == 0) {
+            LLAMA_LOG_INFO("%s: LLAMA_RPC_PARALLEL_LOAD_ASYNC active — non-blocking worker dispatch\n", __func__);
+        }
+    }
+
     std::vector<no_init<uint8_t>> read_buf;
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
 
-    // 4 staging buffers for async uploads, each sized 1MB seems to be a good default for single NVMe drives.
-    // NVMe raid configurations might require more / larger buffers.
-    constexpr size_t n_buffers = 4;
+    // Head-local read pool: on POSIX, issue pread in parallel so the GPU ring
+    // path sees QD>1 against the NVMe. n_buffers grows so that pool_n reads
+    // can be outstanding while a few slots drain their uploads.
+#ifndef _WIN32
+    const size_t head_pool_n = head_read_pool_size();
+    const size_t n_buffers   = head_pool_n > 0 ? head_pool_n + 2 : 4;
+    std::unique_ptr<head_read_pool> head_pool;
+    if (head_pool_n > 0) {
+        head_pool.reset(new head_read_pool(head_pool_n));
+    }
+#else
+    constexpr size_t head_pool_n = 0;
+    constexpr size_t n_buffers   = 4;
+#endif
 
     size_t alignment = 1;
     for (const auto & file : files) {
@@ -1511,6 +1741,84 @@ bool llama_model_loader::load_all_data(
             ggml_backend_name(upload_backend));
     }
 
+    LLAMA_LOG_INFO("%s: head_load_profile: upload_backend=%s\n", __func__,
+                   upload_backend ? "ASYNC_RING" : "NULL_SYNC_FALLBACK");
+
+    int64_t t_ring_read_us = 0, t_ring_event_sync_us = 0, t_ring_submit_us = 0;
+    int64_t t_ring_wait_us = 0;
+    size_t  ring_bytes = 0; int n_ring_tensors = 0;
+    int64_t t_sync_read_us = 0, t_sync_htod_us = 0;
+    size_t  sync_bytes = 0; int n_sync_tensors = 0;
+    int64_t t_cpu_read_us = 0; size_t cpu_bytes = 0; int n_cpu_tensors = 0;
+    int64_t t_rpc_dispatch_us = 0;
+    int n_rpc_ok = 0, n_rpc_fail = 0;
+    const int64_t t_loop_start_us = ggml_time_us();
+
+#ifndef _WIN32
+    // Sliding window of in-flight read tasks. Pushed at submit time, popped
+    // FIFO when the task completes so tensor_set_async is issued in the same
+    // order the chunks were submitted (required within a tensor so later
+    // chunks don't overwrite an earlier chunk's GPU region).
+    struct ring_inflight {
+        std::unique_ptr<head_read_task> task;
+        struct ggml_tensor * cur;
+        void *               upload_src;
+        size_t               upload_offset;
+        size_t               upload_size;
+        size_t               slot_idx;
+    };
+    std::deque<ring_inflight> ring_window;
+    auto ring_pop_front_upload = [&]() {
+        auto & f = ring_window.front();
+        const int64_t t_w0 = ggml_time_us();
+        const bool ok = f.task->wait_done();
+        t_ring_wait_us += ggml_time_us() - t_w0;
+        if (!ok) {
+            throw std::runtime_error(format(
+                "pread failed on tensor '%s' (chunk offset %zu, len %zu)",
+                ggml_get_name(f.cur), (size_t) f.task->offset, f.task->len));
+        }
+        const int64_t t_sub0 = ggml_time_us();
+        ggml_backend_tensor_set_async(upload_backend, f.cur,
+                                      f.upload_src, f.upload_offset, f.upload_size);
+        ggml_backend_event_record(events[f.slot_idx], upload_backend);
+        t_ring_submit_us += ggml_time_us() - t_sub0;
+        ring_window.pop_front();
+    };
+#endif
+
+    // Worker-side read attempt for an RPC-bound tensor. Returns true if the
+    // worker successfully pulled the bytes; false means the caller should
+    // proceed with the normal read+push path. Capability is null if disabled.
+    // When the async dispatch is available, fire-and-forget — actual success
+    // is observed later via flush_pending_rpc_reads() at the end of load.
+    auto try_worker_read = [&](ggml_tensor * cur, const llama_tensor_weight * weight, size_t n_size) -> bool {
+        if (rpc_set_from_file == nullptr && rpc_set_from_file_async == nullptr) {
+            return false;
+        }
+        if (weight->idx >= files_paths.size()) {
+            return false;
+        }
+        const std::string & path = files_paths[weight->idx];
+        if (path.empty()) {
+            return false;
+        }
+        const int64_t t0 = ggml_time_us();
+        bool ok;
+        if (rpc_set_from_file_async != nullptr) {
+            ok = rpc_set_from_file_async(cur->buffer, cur, path.c_str(),
+                                         (uint64_t) weight->offs, /*tensor_offset*/ 0,
+                                         (uint64_t) n_size);
+        } else {
+            ok = rpc_set_from_file(cur->buffer, cur, path.c_str(),
+                                   (uint64_t) weight->offs, /*tensor_offset*/ 0,
+                                   (uint64_t) n_size);
+        }
+        t_rpc_dispatch_us += ggml_time_us() - t0;
+        if (ok) ++n_rpc_ok; else ++n_rpc_fail;
+        return ok;
+    };
+
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
@@ -1551,15 +1859,19 @@ bool llama_model_loader::load_all_data(
                 auto & mmap_used = mmaps_used[weight->idx];
                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
-            } else {
+            } else if (!try_worker_read(cur, weight, n_size)) {
                 ggml_backend_tensor_set(cur, data, 0, n_size);
             }
         } else {
             const auto & file = files.at(weight->idx);
 
             if (ggml_backend_buffer_is_host(cur->buffer)) {
+                const int64_t t_cpu0 = ggml_time_us();
                 file->seek(weight->offs, SEEK_SET);
                 file->read_raw(cur->data, n_size);
+                t_cpu_read_us += ggml_time_us() - t_cpu0;
+                cpu_bytes += n_size;
+                ++n_cpu_tensors;
                 if (check_tensors) {
                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
                         return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
@@ -1568,11 +1880,11 @@ bool llama_model_loader::load_all_data(
             } else {
                 // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
                 if (upload_backend) {
+                    ++n_ring_tensors;
                     size_t offset = weight->offs;
                     alignment = file->read_alignment();
                     size_t aligned_offset = offset & ~(alignment - 1);
                     size_t offset_from_alignment = offset - aligned_offset;
-                    file->seek(aligned_offset, SEEK_SET);
 
                     // Calculate aligned read boundaries
                     size_t read_start = aligned_offset;
@@ -1581,49 +1893,110 @@ bool llama_model_loader::load_all_data(
                     size_t bytes_read = 0;
                     size_t data_read = 0;  // Actual tensor data copied (excluding padding)
 
-                    while (bytes_read < read_end - read_start) {
-                        size_t read_size = std::min<size_t>(buffer_size, read_end - read_start - bytes_read);
+#ifndef _WIN32
+                    if (head_pool) {
+                        const int fd = file->file_id();
+                        while (bytes_read < read_end - read_start) {
+                            size_t read_size = std::min<size_t>(buffer_size, read_end - read_start - bytes_read);
+                            uintptr_t ptr_dest_aligned = (reinterpret_cast<uintptr_t>(host_ptrs[buffer_idx]) + alignment - 1) & ~(alignment - 1);
 
-                        // Align the destination pointer within the pinned buffer
-                        uintptr_t ptr_dest_aligned = (reinterpret_cast<uintptr_t>(host_ptrs[buffer_idx]) + alignment - 1) & ~(alignment - 1);
+                            // Wait for any prior upload on this slot to finish before we overwrite its pinned buffer.
+                            const int64_t t_ev0 = ggml_time_us();
+                            ggml_backend_event_synchronize(events[buffer_idx]);
+                            t_ring_event_sync_us += ggml_time_us() - t_ev0;
 
-                        // Wait for previous upload to complete before reusing buffer
-                        ggml_backend_event_synchronize(events[buffer_idx]);
+                            uintptr_t ptr_data = ptr_dest_aligned;
+                            size_t data_to_copy = read_size;
+                            if (bytes_read == 0) {
+                                ptr_data += offset_from_alignment;
+                                data_to_copy -= offset_from_alignment;
+                            }
+                            if (aligned_offset + bytes_read + read_size > offset + n_size) {
+                                data_to_copy -= (read_end - (offset + n_size));
+                            }
 
-                        // Read aligned chunk from file
-                        file->read_raw_unsafe(reinterpret_cast<void *>(ptr_dest_aligned), read_size);
+                            auto tk = std::unique_ptr<head_read_task>(new head_read_task());
+                            tk->fd     = fd;
+                            tk->dst    = reinterpret_cast<void *>(ptr_dest_aligned);
+                            tk->len    = read_size;
+                            tk->offset = (off_t) (aligned_offset + bytes_read);
 
-                        // Calculate actual data portion (excluding alignment padding)
-                        uintptr_t ptr_data = ptr_dest_aligned;
-                        size_t data_to_copy = read_size;
+                            ring_inflight ifl;
+                            ifl.task          = std::move(tk);
+                            ifl.cur           = cur;
+                            ifl.upload_src    = reinterpret_cast<void *>(ptr_data);
+                            ifl.upload_offset = data_read;
+                            ifl.upload_size   = data_to_copy;
+                            ifl.slot_idx      = buffer_idx;
 
-                        // Skip alignment padding at start of first chunk
-                        if (bytes_read == 0) {
-                            ptr_data += offset_from_alignment;
-                            data_to_copy -= offset_from_alignment;
+                            head_pool->submit(ifl.task.get());
+                            ring_window.push_back(std::move(ifl));
+                            ring_bytes += read_size;
+
+                            // Backpressure: keep the in-flight window bounded by pool_n so the
+                            // pool always has room to run and memory stays predictable.
+                            if (ring_window.size() >= head_pool_n) {
+                                ring_pop_front_upload();
+                            }
+
+                            data_read  += data_to_copy;
+                            bytes_read += read_size;
+                            ++buffer_idx;
+                            buffer_idx %= n_buffers;
                         }
+                    } else
+#endif
+                    {
+                        // Serial fallback: original per-chunk blocking read path.
+                        file->seek(aligned_offset, SEEK_SET);
+                        while (bytes_read < read_end - read_start) {
+                            size_t read_size = std::min<size_t>(buffer_size, read_end - read_start - bytes_read);
+                            uintptr_t ptr_dest_aligned = (reinterpret_cast<uintptr_t>(host_ptrs[buffer_idx]) + alignment - 1) & ~(alignment - 1);
 
-                        // Trim alignment padding at end of last chunk
-                        if (aligned_offset + bytes_read + read_size > offset + n_size) {
-                            data_to_copy -= (read_end - (offset + n_size));
+                            const int64_t t_ev0 = ggml_time_us();
+                            ggml_backend_event_synchronize(events[buffer_idx]);
+                            t_ring_event_sync_us += ggml_time_us() - t_ev0;
+
+                            const int64_t t_rd0 = ggml_time_us();
+                            file->read_raw_unsafe(reinterpret_cast<void *>(ptr_dest_aligned), read_size);
+                            t_ring_read_us += ggml_time_us() - t_rd0;
+                            ring_bytes += read_size;
+
+                            uintptr_t ptr_data = ptr_dest_aligned;
+                            size_t data_to_copy = read_size;
+                            if (bytes_read == 0) {
+                                ptr_data += offset_from_alignment;
+                                data_to_copy -= offset_from_alignment;
+                            }
+                            if (aligned_offset + bytes_read + read_size > offset + n_size) {
+                                data_to_copy -= (read_end - (offset + n_size));
+                            }
+
+                            const int64_t t_sub0 = ggml_time_us();
+                            ggml_backend_tensor_set_async(upload_backend, cur,
+                                                          reinterpret_cast<void *>(ptr_data), data_read, data_to_copy);
+                            ggml_backend_event_record(events[buffer_idx], upload_backend);
+                            t_ring_submit_us += ggml_time_us() - t_sub0;
+
+                            data_read += data_to_copy;
+                            bytes_read += read_size;
+                            ++buffer_idx;
+                            buffer_idx %= n_buffers;
                         }
-
-                        // Async upload actual data to GPU
-                        ggml_backend_tensor_set_async(upload_backend, cur,
-                                                      reinterpret_cast<void *>(ptr_data), data_read, data_to_copy);
-                        ggml_backend_event_record(events[buffer_idx], upload_backend);
-
-                        data_read += data_to_copy;
-                        bytes_read += read_size;
-
-                        ++buffer_idx;
-                        buffer_idx %= n_buffers;
                     }
-                } else {
+                } else if (!try_worker_read(cur, weight, n_size)) {
+                    // Note: when worker-read succeeds, --check-tensors validation
+                    // is bypassed for that tensor (the bytes never touch the head).
+                    const int64_t t_sr0 = ggml_time_us();
                     read_buf.resize(n_size);
                     file->seek(weight->offs, SEEK_SET);
                     file->read_raw(read_buf.data(), n_size);
+                    t_sync_read_us += ggml_time_us() - t_sr0;
+                    sync_bytes += n_size;
+                    const int64_t t_sh0 = ggml_time_us();
                     ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
+                    t_sync_htod_us += ggml_time_us() - t_sh0;
+                    ++n_sync_tensors;
                     if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
                         throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
                     }
@@ -1632,6 +2005,33 @@ bool llama_model_loader::load_all_data(
         }
 
         size_done += n_size;
+    }
+
+#ifndef _WIN32
+    // Drain any remaining in-flight pread tasks; each pop issues the GPU upload
+    // in the same order the chunks were submitted.
+    while (!ring_window.empty()) {
+        ring_pop_front_upload();
+    }
+#endif
+
+    {
+        const double t_loop_total_s = (ggml_time_us() - t_loop_start_us) / 1.0e6;
+        const double GiB = 1024.0 * 1024.0 * 1024.0;
+        LLAMA_LOG_INFO("%s: head load profile — loop wall %.3f s (head_read_pool=%zu)\n",
+                       __func__, t_loop_total_s, head_pool_n);
+        LLAMA_LOG_INFO("  ring  : tensors=%d  bytes=%7.3f GiB  read=%7.3f s  event_sync=%7.3f s  submit=%7.3f s  wait=%7.3f s\n",
+                       n_ring_tensors, ring_bytes / GiB,
+                       t_ring_read_us / 1.0e6, t_ring_event_sync_us / 1.0e6,
+                       t_ring_submit_us / 1.0e6, t_ring_wait_us / 1.0e6);
+        LLAMA_LOG_INFO("  sync  : tensors=%d  bytes=%7.3f GiB  read=%7.3f s  htod      =%7.3f s\n",
+                       n_sync_tensors, sync_bytes / GiB,
+                       t_sync_read_us / 1.0e6, t_sync_htod_us / 1.0e6);
+        LLAMA_LOG_INFO("  cpu   : tensors=%d  bytes=%7.3f GiB  read=%7.3f s\n",
+                       n_cpu_tensors, cpu_bytes / GiB,
+                       t_cpu_read_us / 1.0e6);
+        LLAMA_LOG_INFO("  rpc   : ok=%d  fail=%d  dispatch_time=%7.3f s\n",
+                       n_rpc_ok, n_rpc_fail, t_rpc_dispatch_us / 1.0e6);
     }
 
     // free temporary resources used for async uploads
@@ -1670,6 +2070,13 @@ bool llama_model_loader::load_all_data(
                 }
             }
         }
+        // Dump RPC load profile when LLAMA_RPC_LOAD_PROFILE is set in the env.
+        // No-op when RPC is not built or no RPC tensors were loaded.
+        if (std::getenv("LLAMA_RPC_LOAD_PROFILE")) {
+            if (auto * fn = (void (*)(void)) rpc_proc_address("ggml_backend_rpc_log_load_stats")) {
+                fn();
+            }
+        }
         if (progress_callback) {
             // Even though the model is done loading, we still honor
             // cancellation since we need to free allocations.
@@ -1678,6 +2085,92 @@ bool llama_model_loader::load_all_data(
     }
 
     return true;
+}
+
+bool llama_model_loader::launch_load_all_data(
+        struct ggml_context * ctx,
+        llama_buf_map & bufs,
+        llama_mlocks * lmlocks,
+        llama_progress_callback progress_callback,
+        void * progress_callback_user_data) {
+    static const bool async_enabled = std::getenv("LLAMA_RPC_PARALLEL_LOAD") != nullptr &&
+                                      std::getenv("LLAMA_RPC_PARALLEL_LOAD_ASYNC") != nullptr;
+    if (!async_enabled || bufs.empty()) {
+        return load_all_data(ctx, bufs, lmlocks, progress_callback, progress_callback_user_data);
+    }
+
+    // Identify the backend by the first buffer's name. Parallelize RPC-backed
+    // buffers (one worker per buffer) and GPU ring-path buffers (CUDA etc.);
+    // run CPU/host buffers synchronously.
+    auto first_buf = bufs.begin()->second;
+    const char * name = first_buf ? ggml_backend_buffer_name(first_buf) : nullptr;
+    const bool is_rpc = name && std::strncmp(name, "RPC",  3) == 0;
+    const bool is_gpu = name && (std::strncmp(name, "CUDA",   4) == 0 ||
+                                 std::strncmp(name, "ROCm",   4) == 0 ||
+                                 std::strncmp(name, "HIP",    3) == 0 ||
+                                 std::strncmp(name, "Vulkan", 6) == 0 ||
+                                 std::strncmp(name, "Metal",  5) == 0 ||
+                                 std::strncmp(name, "SYCL",   4) == 0);
+    if (!is_rpc && !is_gpu) {
+        return load_all_data(ctx, bufs, lmlocks, progress_callback, progress_callback_user_data);
+    }
+
+    // Count bytes for optimistic progress bookkeeping.
+    size_t bytes_this_ctx = 0;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        if (get_weight(ggml_get_name(t)) != nullptr) {
+            bytes_this_ctx += ggml_nbytes(t);
+        }
+    }
+
+    // Copy bufs into the thread — llama_buf_map is a small unordered_map and
+    // the caller's reference (into ctx_buf_maps) stays valid until load_tensors
+    // returns anyway, but copying avoids any subtle ordering worries and makes
+    // the thread self-contained.
+    rpc_dispatch_threads.emplace_back(
+        [this, ctx, bufs_copy = bufs, lmlocks, progress_callback, progress_callback_user_data]() mutable {
+            if (!load_all_data(ctx, bufs_copy, lmlocks, progress_callback, progress_callback_user_data)) {
+                rpc_dispatch_error.store(true);
+            }
+        });
+    size_done += bytes_this_ctx;
+
+    LLAMA_LOG_INFO("%s: spawned async loader thread for buffer %s (%.2f GiB)\n",
+                   __func__, name, bytes_this_ctx / (1024.0 * 1024.0 * 1024.0));
+    return true;
+}
+
+bool llama_model_loader::flush_pending_rpc_reads() {
+    // Step 1: join per-buffer dispatcher threads (B1-v2). Each thread fires
+    // async dispatches for its worker; joining here ensures all sends have
+    // been posted before we wait on the RPC backend's receiver threads.
+    const int64_t t_join_0 = ggml_time_us();
+    for (auto & t : rpc_dispatch_threads) {
+        if (t.joinable()) t.join();
+    }
+    const int64_t t_join_us = ggml_time_us() - t_join_0;
+    const size_t n_threads = rpc_dispatch_threads.size();
+    rpc_dispatch_threads.clear();
+    const bool dispatch_ok = !rpc_dispatch_error.load();
+
+    // Step 2: drain per-endpoint receiver threads in the RPC backend.
+    typedef bool (*flush_fn_t)(void);
+    auto * fn = (flush_fn_t) rpc_proc_address("ggml_backend_rpc_flush_pending_reads");
+    if (fn == nullptr) {
+        return dispatch_ok;
+    }
+    const int64_t t_drain_0 = ggml_time_us();
+    const bool drain_ok = fn();
+    const int64_t t_drain_us = ggml_time_us() - t_drain_0;
+    if (n_threads > 0) {
+        LLAMA_LOG_INFO("%s: joined %zu dispatcher thread(s) in %.3f s; drained pending reads in %.3f s — %s\n",
+                       __func__, n_threads, t_join_us / 1.0e6, t_drain_us / 1.0e6,
+                       (dispatch_ok && drain_ok) ? "ok" : "had errors");
+    } else {
+        LLAMA_LOG_INFO("%s: flushed async RPC worker reads — %.3f s, %s\n", __func__,
+                       t_drain_us / 1.0e6, drain_ok ? "ok" : "had errors");
+    }
+    return dispatch_ok && drain_ok;
 }
 
 std::string llama_model_loader::ftype_name() const {

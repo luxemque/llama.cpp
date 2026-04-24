@@ -8049,11 +8049,20 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         return true;
     }
 
-    // load tensor data
+    // load tensor data (B1-v3: launch_load_all_data may run this in a thread
+    // for parallelizable buffer types — GPU ring path and RPC-backed buffers.
+    // CPU/host runs synchronously).
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
-        if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+        if (!ml.launch_load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
+    }
+
+    // Drain any in-flight async dispatcher threads + RPC worker reads. No-op
+    // if the async path was not used. Must happen before tensor data is
+    // consumed.
+    if (!ml.flush_pending_rpc_reads()) {
+        return false;
     }
 
     if (use_mmap_buffer) {
