@@ -23,6 +23,12 @@
 #include <filesystem>
 #include <algorithm>
 
+#ifndef _WIN32
+#include <unistd.h>
+#include <fcntl.h>
+#include <cerrno>
+#endif
+
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
@@ -1173,6 +1179,34 @@ public:
         return cached;
     }
 
+    // Resolved root directory under which SET_TENSOR_FROM_FILE paths must
+    // live (empty = unrestricted). Configured via LLAMA_RPC_MODEL_ROOT.
+    // Canonicalised once at first use; includes a trailing '/'. POSIX only —
+    // on Windows the env var is ignored (separator handling differs).
+    static const std::string & model_root() {
+        static std::string cached = [](){
+#ifdef _WIN32
+            return std::string();
+#else
+            const char * s = std::getenv("LLAMA_RPC_MODEL_ROOT");
+            if (s == nullptr || *s == '\0') {
+                return std::string();
+            }
+            std::error_code ec;
+            auto canon = std::filesystem::weakly_canonical(std::filesystem::path(s), ec);
+            if (ec) {
+                GGML_LOG_ERROR("LLAMA_RPC_MODEL_ROOT='%s' could not be resolved: %s\n",
+                               s, ec.message().c_str());
+                return std::string();
+            }
+            std::string out = canon.string();
+            if (!out.empty() && out.back() != '/') out += '/';
+            return out;
+#endif
+        }();
+        return cached;
+    }
+
     void hello(rpc_msg_hello_rsp & response);
     bool alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_alloc_buffer_rsp & response);
     bool get_alignment(const rpc_msg_get_alignment_req & request, rpc_msg_get_alignment_rsp & response);
@@ -1581,6 +1615,29 @@ bool rpc_server::set_tensor_from_file(const std::vector<uint8_t> & input,
         return true;
     }
 
+    // Defence in depth: if LLAMA_RPC_MODEL_ROOT is configured, resolve the
+    // requested path and reject anything that escapes the root (e.g. via
+    // symlinks the syntactic /../ check above cannot catch). Unset root =
+    // unrestricted, preserving prior behaviour.
+    {
+        const std::string & root = model_root();
+        if (!root.empty()) {
+            std::error_code ec;
+            auto canon = std::filesystem::weakly_canonical(std::filesystem::path(path), ec);
+            if (ec) {
+                GGML_LOG_ERROR("[%s] cannot canonicalise '%s': %s\n",
+                               __func__, path.c_str(), ec.message().c_str());
+                return true;
+            }
+            std::string resolved = canon.string();
+            if (resolved.rfind(root, 0) != 0) {
+                GGML_LOG_ERROR("[%s] path '%s' resolved to '%s' outside root '%s'\n",
+                               __func__, path.c_str(), resolved.c_str(), root.c_str());
+                return true;
+            }
+        }
+    }
+
     // Deserialize the destination tensor (mirrors set_tensor).
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
@@ -1618,6 +1675,20 @@ bool rpc_server::set_tensor_from_file(const std::vector<uint8_t> & input,
     // N.B. mmap fast-path was tried here — it caused a 3× regression because
     // cudaMemcpyAsync on unpinned mmap'd memory demand-faults pages one-at-a-
     // time. Pinning from a pread'd buffer is the right shape.
+#ifndef _WIN32
+    // POSIX fast path: one freshly-opened fd per call, concurrent pread below.
+    // Per-call open() is a stat + inode lookup (~µs on same-path NVMe, bounded
+    // at a few hundred opens per cold load) — negligible next to the ~50 ms
+    // read per ~295 MiB tensor. Caching the fd is a future optimisation.
+    int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        GGML_LOG_ERROR("[%s] cannot open '%s': %s\n",
+                       __func__, path.c_str(), strerror(errno));
+        return true; // signal fallback
+    }
+#else
+    // Windows fallback: no pread; each pool thread opens its own ifstream and
+    // seeks independently.
     std::ifstream ifs(path, std::ios::binary);
     if (!ifs.is_open()) {
         GGML_LOG_ERROR("[%s] cannot open '%s'\n", __func__, path.c_str());
@@ -1629,6 +1700,7 @@ bool rpc_server::set_tensor_from_file(const std::vector<uint8_t> & input,
                        __func__, file_offset, path.c_str());
         return true;
     }
+#endif
 
     uint8_t * dst = nullptr;
     std::vector<uint8_t> fallback_buf;
@@ -1645,6 +1717,29 @@ bool rpc_server::set_tensor_from_file(const std::vector<uint8_t> & input,
 
     const auto probe_t1 = std::chrono::steady_clock::now();
 
+#ifndef _WIN32
+    size_t done = 0;
+    while (done < size) {
+        ssize_t r = ::pread(fd, dst + done, size - done,
+                            (off_t) (file_offset + done));
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            GGML_LOG_ERROR("[%s] pread at %" PRIu64 " in '%s' failed: %s\n",
+                           __func__, file_offset + done,
+                           path.c_str(), strerror(errno));
+            ::close(fd);
+            return true;
+        }
+        if (r == 0) break; // EOF before completion — caught by short-read below
+        done += (size_t) r;
+    }
+    ::close(fd);
+    if (done != size) {
+        GGML_LOG_ERROR("[%s] short read at %" PRIu64 " in '%s': got %zu of %" PRIu64 "\n",
+                       __func__, file_offset, path.c_str(), done, size);
+        return true;
+    }
+#else
     ifs.read((char *) dst, (std::streamsize) size);
     const std::streamsize got = ifs.gcount();
     if ((uint64_t) got != size) {
@@ -1653,6 +1748,7 @@ bool rpc_server::set_tensor_from_file(const std::vector<uint8_t> & input,
                        (long long) got, size);
         return true;
     }
+#endif
 
     const auto probe_t2 = std::chrono::steady_clock::now();
 
