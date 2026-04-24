@@ -1145,14 +1145,33 @@ public:
     rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir)
         : backends(std::move(all_backends)), cache_dir(cache_dir) {
         stored_graphs.resize(backends.size());
-        // staging_buffers[backend_idx][0] — single slot used by the
-        // main-thread SET_TENSOR_FROM_FILE handler.
+        // staging_buffers[backend_idx][thread_idx]. Thread dimension sized to
+        // the set_tensor_from_file pool width; +1 for the main-thread
+        // fallback slot used when the pool is disabled (pool_size==0).
         staging_buffers.resize(backends.size());
+        const size_t slots = pool_size() + 1;
         for (auto & row : staging_buffers) {
-            row.resize(1);
+            row.resize(slots);
         }
     }
     ~rpc_server();
+
+    // Read the SET_TENSOR_FROM_FILE worker pool size once per process. 0
+    // disables the pool (main-thread path). Defaults to 8, overridable via
+    // LLAMA_RPC_STFF_POOL env var.
+    static size_t pool_size() {
+        static size_t cached = [](){
+            const char * s = std::getenv("LLAMA_RPC_STFF_POOL");
+            if (s != nullptr) {
+                long v = std::atol(s);
+                if (v >= 0 && v <= 64) {
+                    return (size_t) v;
+                }
+            }
+            return (size_t) 8;
+        }();
+        return cached;
+    }
 
     void hello(rpc_msg_hello_rsp & response);
     bool alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_alloc_buffer_rsp & response);
@@ -1209,12 +1228,33 @@ private:
 
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
+    std::mutex buffers_mu;                                 // guards `buffers` (pool threads never mutate it; kept for future-proofing)
     std::unordered_set<ggml_backend_buffer_t> buffers;
     // store the last computed graph for each backend
     std::vector<stored_graph> stored_graphs;
-    // staging_buffers[backend_idx][0] — reused pinned host staging region
-    // for the main-thread SET_TENSOR_FROM_FILE handler.
+    // staging_buffers[backend_idx][thread_idx]. thread_idx 0..pool_size-1 are
+    // pool workers; the last slot is the main-thread fallback.
     std::vector<std::vector<staging_buffer>> staging_buffers;
+
+    // Serialises ggml_backend_tensor_set across pool threads. Single-stream
+    // tset runs at ~5 ms/tensor; with N pool threads contending on the CUDA
+    // context concurrently the same call climbs to ~125–160 ms/tensor.
+    // Holding this mutex across the HtoD keeps the context single-tenant
+    // without giving up pool read parallelism. The dedicated-uploader
+    // variant (Refactor F attempt, not shipped) dropped per-tset further to
+    // ~52 ms but regressed setup cost by 3× — net loss.
+    std::mutex tset_mu;
+
+    // Diagnostic probe — aggregated across all threads on this connection.
+    // Destructor prints the totals. Atomic because pool workers update
+    // concurrently.
+    struct stff_probe {
+        std::atomic<uint64_t> count   {0};
+        std::atomic<uint64_t> bytes   {0};
+        std::atomic<uint64_t> ns_setup{0};
+        std::atomic<uint64_t> ns_read {0};
+        std::atomic<uint64_t> ns_tset {0};
+    } stff;
 };
 
 void rpc_server::hello(rpc_msg_hello_rsp & response) {
@@ -1508,6 +1548,7 @@ uint8_t * rpc_server::get_staging(size_t backend_idx, size_t thread_idx, size_t 
 bool rpc_server::set_tensor_from_file(const std::vector<uint8_t> & input,
                                       rpc_msg_set_tensor_from_file_rsp & response,
                                       size_t thread_idx) {
+    const auto probe_t0 = std::chrono::steady_clock::now();
     response.result     = 0;
     response.bytes_read = 0;
 
@@ -1602,6 +1643,8 @@ bool rpc_server::set_tensor_from_file(const std::vector<uint8_t> & input,
         dst = fallback_buf.data();
     }
 
+    const auto probe_t1 = std::chrono::steady_clock::now();
+
     ifs.read((char *) dst, (std::streamsize) size);
     const std::streamsize got = ifs.gcount();
     if ((uint64_t) got != size) {
@@ -1611,7 +1654,24 @@ bool rpc_server::set_tensor_from_file(const std::vector<uint8_t> & input,
         return true;
     }
 
-    ggml_backend_tensor_set(tensor, dst, tensor_offset, size);
+    const auto probe_t2 = std::chrono::steady_clock::now();
+
+    // HtoD, serialised across pool threads. See tset_mu comment for rationale.
+    {
+        std::lock_guard<std::mutex> lk(tset_mu);
+        ggml_backend_tensor_set(tensor, dst, tensor_offset, size);
+    }
+
+    const auto probe_t3 = std::chrono::steady_clock::now();
+
+    const uint64_t ns_setup = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(probe_t1 - probe_t0).count();
+    const uint64_t ns_read  = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(probe_t2 - probe_t1).count();
+    const uint64_t ns_tset  = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(probe_t3 - probe_t2).count();
+    stff.count.fetch_add(1,           std::memory_order_relaxed);
+    stff.bytes.fetch_add(size,        std::memory_order_relaxed);
+    stff.ns_setup.fetch_add(ns_setup, std::memory_order_relaxed);
+    stff.ns_read.fetch_add(ns_read,   std::memory_order_relaxed);
+    stff.ns_tset.fetch_add(ns_tset,   std::memory_order_relaxed);
 
     response.result     = 1;
     response.bytes_read = size;
@@ -1947,6 +2007,28 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
 }
 
 rpc_server::~rpc_server() {
+    const uint64_t count    = stff.count.load();
+    if (count > 0) {
+        const uint64_t bytes    = stff.bytes.load();
+        const uint64_t ns_setup = stff.ns_setup.load();
+        const uint64_t ns_read  = stff.ns_read.load();
+        const uint64_t ns_tset  = stff.ns_tset.load();
+        const double total_ms = (ns_setup + ns_read + ns_tset) / 1e6;
+        const double gib = (double) bytes / (1024.0 * 1024.0 * 1024.0);
+        // Sum of per-call times; wall time is lower when pool threads overlap.
+        GGML_LOG_INFO("[stff_probe_summary] tensors=%" PRIu64 " bytes=%.2f GiB pool=%zu\n",
+                      count, gib, pool_size());
+        GGML_LOG_INFO("[stff_probe_summary]   setup  = %.3f s  (avg %.3f ms/tensor)\n",
+                      ns_setup / 1e9, (ns_setup / 1e6) / count);
+        GGML_LOG_INFO("[stff_probe_summary]   read   = %.3f s  (avg %.3f ms/tensor, %.2f GiB/s summed)\n",
+                      ns_read / 1e9, (ns_read / 1e6) / count,
+                      gib / (ns_read / 1e9));
+        GGML_LOG_INFO("[stff_probe_summary]   tset   = %.3f s  (avg %.3f ms/tensor, %.2f GiB/s summed)\n",
+                      ns_tset / 1e9, (ns_tset / 1e6) / count,
+                      gib / (ns_tset / 1e9));
+        GGML_LOG_INFO("[stff_probe_summary]   total  = %.3f s  (avg %.3f ms/tensor)\n",
+                      total_ms / 1000.0, total_ms / count);
+    }
     for (auto buffer : buffers) {
         ggml_backend_buffer_free(buffer);
     }
@@ -1958,6 +2040,198 @@ rpc_server::~rpc_server() {
         }
     }
 }
+
+// --- SET_TENSOR_FROM_FILE worker pool (Refactor D — QD>1 pread) --------------
+//
+// The probe in Refactor C's diagnostic section showed 83% of the worker-side
+// load wall sits in `ifs.read()` at ~1.3 GiB/s — single-stream NVMe QD=1.
+// Pool lets N `pread`s be in flight concurrently so the drive sees QD=N,
+// lifting aggregate read throughput toward its spec (~3+ GiB/s at QD=8).
+//
+// Invariants:
+//   - Acks are emitted in request-submission order. The head's response
+//     receiver (rpc_load_pipeline) drains FIFO per endpoint — see
+//     ggml_backend_rpc_buffer_set_tensor_from_file_async.
+//   - Order-preservation is achieved on the *main* thread: it keeps a FIFO
+//     queue of in-flight tasks and sends acks from the front as each task
+//     reports `done`. Workers may complete out of order; acks do not.
+//   - Each worker uses a thread-indexed staging slot in `rpc_server::get_staging`
+//     so per-connection pinned buffers don't contend.
+//   - Pool is owned by a single connection; destroyed when the connection
+//     ends, which drains any in-flight tasks first.
+
+struct stff_task {
+    std::vector<uint8_t> input;                      // owned copy of request payload
+    rpc_msg_set_tensor_from_file_rsp response = {};
+    bool ok_from_handler = true;                     // reflects handler's return value
+    std::atomic<bool> done{false};
+    std::mutex mu;
+    std::condition_variable cv;
+
+    void mark_done() {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            done.store(true, std::memory_order_release);
+        }
+        cv.notify_all();
+    }
+
+    void wait_done() {
+        std::unique_lock<std::mutex> lk(mu);
+        cv.wait(lk, [&]{ return done.load(std::memory_order_acquire); });
+    }
+};
+
+class stff_pool {
+public:
+    stff_pool(rpc_server * srv, size_t n_threads) : srv_(srv), n_(n_threads) {
+        workers_.reserve(n_threads);
+        for (size_t i = 0; i < n_threads; ++i) {
+            workers_.emplace_back([this, i]() { worker_loop(i); });
+        }
+    }
+    ~stff_pool() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        for (auto & t : workers_) {
+            if (t.joinable()) t.join();
+        }
+    }
+
+    void submit(stff_task * t) {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            queue_.push(t);
+        }
+        cv_.notify_one();
+    }
+
+    size_t size() const { return n_; }
+
+private:
+    void worker_loop(size_t thread_idx) {
+        while (true) {
+            stff_task * t = nullptr;
+            {
+                std::unique_lock<std::mutex> lk(mu_);
+                cv_.wait(lk, [&]{ return stop_ || !queue_.empty(); });
+                if (stop_ && queue_.empty()) {
+                    return;
+                }
+                t = queue_.front();
+                queue_.pop();
+            }
+            // Execute the full read + (mutex-serialised) tset in one call.
+            t->ok_from_handler = srv_->set_tensor_from_file(t->input, t->response, thread_idx);
+            t->mark_done();
+        }
+    }
+
+    rpc_server *             srv_;
+    size_t                   n_;
+    std::vector<std::thread> workers_;
+    std::queue<stff_task *>  queue_;
+    std::mutex               mu_;
+    std::condition_variable  cv_;
+    bool                     stop_ = false;
+};
+
+// Dedicated ack-sender for SET_TENSOR_FROM_FILE. The main thread pushes
+// completed-or-in-flight tasks into a FIFO; this thread peeks the front,
+// waits for that task to finish, sends the ack, then pops. Decoupling ack
+// progress from the main recv loop avoids the deadlock where the head
+// stops dispatching new STFF requests (waiting for acks) while the
+// worker's main thread is blocked in recv_data() waiting for a command
+// that never comes — leaving the last batch of acks undrained.
+class stff_ack_sender {
+public:
+    stff_ack_sender(socket_ptr sock, size_t max_inflight)
+        : sock_(std::move(sock)), max_inflight_(max_inflight) {
+        sender_ = std::thread([this]() { sender_loop(); });
+    }
+    ~stff_ack_sender() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            stop_ = true;
+        }
+        cv_push_.notify_all();
+        if (sender_.joinable()) {
+            sender_.join();
+        }
+    }
+
+    // Enqueue a task whose worker submission follows immediately. Blocks
+    // if the FIFO is full (bounds memory: each task holds its request
+    // payload). Returns false if a prior ack send failed.
+    bool push(std::unique_ptr<stff_task> t) {
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_pop_.wait(lk, [&]{ return failed_ || q_.size() < max_inflight_; });
+        if (failed_) {
+            return false;
+        }
+        q_.push(std::move(t));
+        cv_push_.notify_one();
+        return true;
+    }
+
+    // Block until every queued ack has been sent. Returns false if any
+    // send failed along the way.
+    bool wait_empty() {
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_pop_.wait(lk, [&]{ return failed_ || q_.empty(); });
+        return !failed_;
+    }
+
+private:
+    void sender_loop() {
+        while (true) {
+            stff_task * front_raw = nullptr;
+            bool suppress_send = false;
+            {
+                std::unique_lock<std::mutex> lk(mu_);
+                cv_push_.wait(lk, [&]{ return stop_ || !q_.empty(); });
+                if (q_.empty()) {
+                    return;
+                }
+                front_raw = q_.front().get();
+                // Once we've hit a send failure, keep draining wait_done()
+                // so the pool destructor can safely join — but stop sending.
+                suppress_send = failed_;
+            }
+            // Wait for the task outside the lock so pushes/backpressure
+            // can progress while a slow worker finishes.
+            front_raw->wait_done();
+            bool ok = true;
+            if (!suppress_send) {
+                ok = front_raw->ok_from_handler &&
+                     send_msg(sock_, &front_raw->response, sizeof(front_raw->response));
+            }
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                q_.pop();
+                if (!ok) {
+                    failed_ = true;
+                }
+            }
+            cv_pop_.notify_all();
+            // Loop even after failure: remaining tasks still need
+            // wait_done() before the pool destructor joins workers.
+        }
+    }
+
+    socket_ptr                             sock_;
+    size_t                                 max_inflight_;
+    std::queue<std::unique_ptr<stff_task>> q_;
+    std::mutex                             mu_;
+    std::condition_variable                cv_push_;
+    std::condition_variable                cv_pop_;
+    std::thread                            sender_;
+    bool                                   stop_   = false;
+    bool                                   failed_ = false;
+};
 
 static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
                              socket_ptr sock) {
@@ -1999,6 +2273,19 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
     // Activate transport upgrade using client's caps
     sock->update_caps(req.conn_caps);
 
+    // Set up the SET_TENSOR_FROM_FILE worker pool for QD>1 pread on the
+    // rpc-server side. See the stff_pool comment block above for invariants.
+    // Declaration order matters for teardown: the ack sender is destroyed
+    // first (joining its thread, which calls wait_done() on pending tasks),
+    // which requires the worker pool to still be alive.
+    const size_t pool_n = rpc_server::pool_size();
+    std::unique_ptr<stff_pool>       stff_workers;
+    std::unique_ptr<stff_ack_sender> stff_acks;
+    if (pool_n > 0) {
+        stff_workers.reset(new stff_pool(&server, pool_n));
+        stff_acks.reset(new stff_ack_sender(sock, pool_n * 2));
+    }
+
     while (true) {
         if (!sock->recv_data(&cmd, 1)) {
             break;
@@ -2007,6 +2294,16 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
             // fail fast if the command is invalid
             GGML_LOG_ERROR("Unknown command: %d\n", cmd);
             break;
+        }
+        // For any command other than SET_TENSOR_FROM_FILE, drain pending
+        // acks first so subsequent operations see a consistent state. The
+        // head can reorder across tensors but not across command types.
+        // wait_empty() also serializes with the ack sender so the main
+        // thread's send_msg calls below don't race with it on the socket.
+        if (cmd != RPC_CMD_SET_TENSOR_FROM_FILE && stff_acks) {
+            if (!stff_acks->wait_empty()) {
+                return;
+            }
         }
         switch (cmd) {
             case RPC_CMD_HELLO: {
@@ -2149,12 +2446,23 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!recv_msg(sock, input)) {
                     return;
                 }
-                rpc_msg_set_tensor_from_file_rsp response = {};
-                if (!server.set_tensor_from_file(input, response)) {
-                    return;
-                }
-                if (!send_msg(sock, &response, sizeof(response))) {
-                    return;
+                if (stff_workers) {
+                    auto t = std::unique_ptr<stff_task>(new stff_task());
+                    t->input = std::move(input);
+                    stff_task * raw = t.get();
+                    if (!stff_acks->push(std::move(t))) {
+                        return;
+                    }
+                    stff_workers->submit(raw);
+                } else {
+                    // Pool disabled — serial fallback, main-thread slot.
+                    rpc_msg_set_tensor_from_file_rsp response = {};
+                    if (!server.set_tensor_from_file(input, response, /*thread_idx=*/ pool_n)) {
+                        return;
+                    }
+                    if (!send_msg(sock, &response, sizeof(response))) {
+                        return;
+                    }
                 }
                 break;
             }
