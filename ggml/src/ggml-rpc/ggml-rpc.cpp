@@ -1179,28 +1179,45 @@ public:
         return cached;
     }
 
-    // Resolved root directory under which SET_TENSOR_FROM_FILE paths must
-    // live (empty = unrestricted). Configured via LLAMA_RPC_MODEL_ROOT.
-    // Canonicalised once at first use; includes a trailing '/'. POSIX only —
-    // on Windows the env var is ignored (separator handling differs).
-    static const std::string & model_root() {
-        static std::string cached = [](){
+    // Resolved root directories under which SET_TENSOR_FROM_FILE paths must
+    // live (empty list = unrestricted). Configured via LLAMA_RPC_MODEL_ROOT
+    // as a colon-separated list (PATH-style); a single path remains the
+    // common case. Each segment is canonicalised once at first use and stored
+    // with a trailing '/'. Bad segments are logged and dropped; if all
+    // segments are bad/empty the result is empty (unrestricted), matching the
+    // single-path failure mode. POSIX only — on Windows the env var is
+    // ignored (separator handling differs).
+    static const std::vector<std::string> & model_roots() {
+        static std::vector<std::string> cached = [](){
 #ifdef _WIN32
-            return std::string();
+            return std::vector<std::string>{};
 #else
             const char * s = std::getenv("LLAMA_RPC_MODEL_ROOT");
             if (s == nullptr || *s == '\0') {
-                return std::string();
+                return std::vector<std::string>{};
             }
-            std::error_code ec;
-            auto canon = std::filesystem::weakly_canonical(std::filesystem::path(s), ec);
-            if (ec) {
-                GGML_LOG_ERROR("LLAMA_RPC_MODEL_ROOT='%s' could not be resolved: %s\n",
-                               s, ec.message().c_str());
-                return std::string();
+            std::vector<std::string> out;
+            std::string raw(s);
+            size_t pos = 0;
+            while (pos <= raw.size()) {
+                size_t next = raw.find(':', pos);
+                size_t end = (next == std::string::npos) ? raw.size() : next;
+                std::string seg = raw.substr(pos, end - pos);
+                if (!seg.empty()) {
+                    std::error_code ec;
+                    auto canon = std::filesystem::weakly_canonical(std::filesystem::path(seg), ec);
+                    if (ec) {
+                        GGML_LOG_ERROR("LLAMA_RPC_MODEL_ROOT segment '%s' could not be resolved: %s\n",
+                                       seg.c_str(), ec.message().c_str());
+                    } else {
+                        std::string r = canon.string();
+                        if (!r.empty() && r.back() != '/') r += '/';
+                        out.push_back(std::move(r));
+                    }
+                }
+                if (next == std::string::npos) break;
+                pos = next + 1;
             }
-            std::string out = canon.string();
-            if (!out.empty() && out.back() != '/') out += '/';
             return out;
 #endif
         }();
@@ -1616,12 +1633,12 @@ bool rpc_server::set_tensor_from_file(const std::vector<uint8_t> & input,
     }
 
     // Defence in depth: if LLAMA_RPC_MODEL_ROOT is configured, resolve the
-    // requested path and reject anything that escapes the root (e.g. via
-    // symlinks the syntactic /../ check above cannot catch). Unset root =
-    // unrestricted, preserving prior behaviour.
+    // requested path and reject anything that escapes every configured root
+    // (e.g. via symlinks the syntactic /../ check above cannot catch). Empty
+    // root list = unrestricted, preserving prior behaviour.
     {
-        const std::string & root = model_root();
-        if (!root.empty()) {
+        const std::vector<std::string> & roots = model_roots();
+        if (!roots.empty()) {
             std::error_code ec;
             auto canon = std::filesystem::weakly_canonical(std::filesystem::path(path), ec);
             if (ec) {
@@ -1630,9 +1647,18 @@ bool rpc_server::set_tensor_from_file(const std::vector<uint8_t> & input,
                 return true;
             }
             std::string resolved = canon.string();
-            if (resolved.rfind(root, 0) != 0) {
-                GGML_LOG_ERROR("[%s] path '%s' resolved to '%s' outside root '%s'\n",
-                               __func__, path.c_str(), resolved.c_str(), root.c_str());
+            bool allowed = false;
+            for (const auto & root : roots) {
+                if (resolved.rfind(root, 0) == 0) { allowed = true; break; }
+            }
+            if (!allowed) {
+                std::string roots_str;
+                for (size_t i = 0; i < roots.size(); ++i) {
+                    if (i) roots_str += ':';
+                    roots_str += roots[i];
+                }
+                GGML_LOG_ERROR("[%s] path '%s' resolved to '%s' outside roots [%s]\n",
+                               __func__, path.c_str(), resolved.c_str(), roots_str.c_str());
                 return true;
             }
         }
